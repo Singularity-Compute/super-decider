@@ -1,0 +1,685 @@
+--- a/vllm/model_executor/models/diffusion_gemma.py	2026-10-13 18:26:58.226567959 +0000
++++ b/vllm/model_executor/models/diffusion_gemma.py	2026-10-13 22:04:06.187266414 +0000
+@@ -73,6 +73,43 @@
+ 
+ logger = init_logger(__name__)
+ 
++# ---- djev thinking-path kernels (env flags, default off) -------------------
++import json as _djev_json
++import os as _djev_os
++import random as _djev_random
++
++_DJEV_FP8_LMHEAD = _djev_os.environ.get("DJEV_FP8_LMHEAD", "0") == "1"
++_DJEV_FUSED_SAMPLER = _djev_os.environ.get("DJEV_FUSED_SAMPLER", "0") == "1"
++_DJEV_BATCH_SC = _djev_os.environ.get("DJEV_BATCH_SC", "1") == "1"
++_DJEV_KB_PARITY = _djev_os.environ.get("DJEV_KB_PARITY", "")
++_DJEV_KB_PARITY_MAX = int(_djev_os.environ.get("DJEV_KB_PARITY_MAX", "400"))
++# FP8 copy of the tied embedding (per-vocab-row scale) + the final softcap value.
++_DJEV_KB: dict = {"e8": None, "sv": None, "sv_col": None, "softcap": None, "n_parity": 0}
++if _DJEV_FP8_LMHEAD or _DJEV_FUSED_SAMPLER:
++    import vllm._custom_ops as _djev_ops
++    from vllm.model_executor.models import djev_kb_kernels as _djev_kb
++
++    logger.info(
++        "djev-kb: FP8_LMHEAD=%s FUSED_SAMPLER=%s BATCH_SC=%s PARITY=%s",
++        _DJEV_FP8_LMHEAD, _DJEV_FUSED_SAMPLER, _DJEV_BATCH_SC, bool(_DJEV_KB_PARITY),
++    )
++
++
++@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
++def _djev_softcap_keep_ninf(logits: torch.Tensor, cap: float) -> torch.Tensor:
++    """fp32 softcap that keeps -inf (grammar / top-k masks applied to raw logits).
++    Compiled so it is one pointwise kernel (no fp32 temporaries), like _softcap_logits."""
++    x = logits.float()
++    return torch.where(torch.isneginf(x), x, torch.tanh(x / cap) * cap)
++
++
++def _djev_parity_log(rec: dict) -> None:
++    if not _DJEV_KB_PARITY or _DJEV_KB["n_parity"] >= _DJEV_KB_PARITY_MAX:
++        return
++    _DJEV_KB["n_parity"] += 1
++    with open(_DJEV_KB_PARITY, "a") as f:
++        f.write(_djev_json.dumps(rec) + "\n")
++
+ 
+ class DiffusionGemmaSelfConditioning(nn.Module):
+     """Gated MLP that processes soft embeddings from the previous denoising step.
+@@ -352,8 +389,45 @@
+             if self.final_logit_softcapping is not None:
+                 logits = _softcap_logits(logits, self.final_logit_softcapping)
+             return logits
+-        logits = self.logits_processor(self.lm_head, hidden_states)
++        if (
++            _DJEV_FP8_LMHEAD
++            and _DJEV_KB["e8"] is not None
++            and hidden_states.shape[0] > 0
++        ):
++            # FP8 W8A8 lm_head: per-token activation x per-vocab-row weight scale.
++            x8, xs = _djev_ops.scaled_fp8_quant(
++                hidden_states.contiguous(), use_per_token_if_dynamic=True
++            )
++            logits = _djev_ops.cutlass_scaled_mm(
++                x8, _DJEV_KB["e8"].t(), xs, _DJEV_KB["sv_col"], hidden_states.dtype
++            )
++            if (
++                _DJEV_KB_PARITY
++                and _DJEV_KB["n_parity"] < _DJEV_KB_PARITY_MAX
++                and hidden_states.shape[0] <= 256
++            ):
++                ref = self.logits_processor(self.lm_head, hidden_states)
++                cap = self.final_logit_softcapping or 1e9
++                a = _djev_softcap_keep_ninf(ref, cap)
++                b = _djev_softcap_keep_ninf(logits, cap)
++                la, lb = a.log_softmax(-1), b.log_softmax(-1)
++                _djev_parity_log({
++                    "kind": "lmhead", "rows": int(a.shape[0]),
++                    "top1_agree": float((a.argmax(-1) == b.argmax(-1)).float().mean()),
++                    "kl_mean": float((la.exp() * (la - lb)).sum(-1).mean()),
++                    "kl_max": float((la.exp() * (la - lb)).sum(-1).max()),
++                    "max_abs_logit_diff": float((a - b).abs().max()),
++                    "rel_err": float((a - b).norm() / a.norm()),
++                })
++        else:
++            logits = self.logits_processor(self.lm_head, hidden_states)
+         if logits is not None and self.final_logit_softcapping is not None:
++            if _DJEV_FUSED_SAMPLER and not (states is not None and states.constrained):
++                # Raw (bf16) logits: the DiffusionSampler applies the softcap
++                # inside the fused vocab kernel, or explicitly before any
++                # non-fused path (it detects raw logits by dtype != fp32).
++                _DJEV_KB["softcap"] = self.final_logit_softcapping
++                return logits
+             logits = _softcap_logits(logits, self.final_logit_softcapping)
+         return logits
+ 
+@@ -362,7 +436,13 @@
+         loader = AutoWeightsLoader(
+             self, ignore_unexpected_prefixes=["embed_vision.embedding."]
+         )
+-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        if _DJEV_FP8_LMHEAD and get_tp_group().world_size == 1:
++            e8, sv = _djev_kb.build_fp8_embedding(self.model.embed_tokens.weight.data)
++            _DJEV_KB["e8"], _DJEV_KB["sv"] = e8, sv
++            _DJEV_KB["sv_col"] = sv.view(-1, 1).contiguous()
++            logger.info("djev-kb: FP8 embedding copy built %s", tuple(e8.shape))
++        return loaded
+ 
+     @classmethod
+     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+@@ -496,6 +576,8 @@
+     # ``embed_weight`` holds those ids' rows, so every argmax is an index
+     # into ``allowed``. ``vocab_size`` stays the real vocabulary for renoise.
+     allowed: torch.Tensor | None = None,
++    djev_e8: torch.Tensor | None = None,
++    djev_sv: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Compiled decode step: temperature → Gumbel sample → probs/confidence →
+     accept/renoise → convergence, all as vectorized PyTorch ops.
+@@ -632,9 +714,15 @@
+         # its local vocab slice [sc_vocab_start, sc_vocab_end) and the
+         # partials are summed across ranks.
+         local_probs = probs[..., sc_vocab_start:sc_vocab_end].to(embed_weight.dtype)
+-        soft_embeds = torch.matmul(
+-            local_probs, embed_weight[: sc_vocab_end - sc_vocab_start]
+-        )
++        if djev_e8 is not None:
++            # DJEV_FP8_LMHEAD: FP8-weight / bf16-probs soft-embedding GEMM.
++            soft_embeds = torch.ops.djev_kb.sc_fp8_gemm(
++                local_probs.reshape(-1, local_probs.shape[-1]), djev_e8, djev_sv
++            ).view(num_decode, CL, -1)
++        else:
++            soft_embeds = torch.matmul(
++                local_probs, embed_weight[: sc_vocab_end - sc_vocab_start]
++            )
+         if tp_size > 1:
+             soft_embeds = torch.ops.vllm.all_reduce(
+                 soft_embeds, group_name=tp_group_name
+@@ -667,6 +755,152 @@
+     return scaled
+ 
+ 
++@torch._dynamo.config.patch(recompile_limit=64)
++@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
++def _djev_post_sample_step(
++    new_tokens: torch.Tensor,  # [num_decode, CL] Gumbel-max samples
++    argmax_tokens: torch.Tensor,  # [num_decode, CL]
++    token_entropy: torch.Tensor,  # [num_decode, CL]
++    soft_flat: torch.Tensor | None,  # [num_decode * CL, hidden] probs @ E (no normalizer)
++    decode_slots: torch.Tensor,
++    decode_idx: torch.Tensor,
++    all_slots: torch.Tensor,
++    valid_canvas_len: torch.Tensor,
++    canvas: torch.Tensor,
++    argmax_canvas: torch.Tensor,
++    step_tensor: torch.Tensor,
++    is_encoder_phase: torch.Tensor,
++    confident_tensor: torch.Tensor,
++    sc_embeds: torch.Tensor,
++    normalizer: torch.Tensor,
++    history: torch.Tensor,
++    history_len_tensor: torch.Tensor,
++    max_steps_tensor: torch.Tensor,
++    pin_mask: torch.Tensor,
++    seed_canvas: torch.Tensor,
++    read_only: torch.Tensor,
++    sampled: torch.Tensor,
++    num_sampled: torch.Tensor,
++    draft_tokens: torch.Tensor,
++    confidence_threshold: float,
++    vocab_size: int,
++    CL: int,
++    ST: int,
++    entropy_bound: float,
++    compute_sc: bool = True,
++) -> None:
++    """DJEV_FUSED_SAMPLER: phases 4-7 of _compiled_sample_step (verbatim) for
++    samples/argmax/entropy/soft-embeds produced by the fused vocab kernel."""
++    num_decode = decode_slots.shape[0]
++    device = decode_slots.device
++    mean_entropy = token_entropy.mean(dim=-1)  # [num_decode]
++    confident_tensor[decode_slots] = mean_entropy < confidence_threshold
++
++    # ---- Phase 4: Entropy-bound acceptance mask ----
++    sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
++    cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
++    cummax_ent = torch.cummax(sorted_ent, dim=-1).values
++    sorted_mask = (cumsum_ent - cummax_ent) <= entropy_bound
++    eb_mask = torch.zeros_like(sorted_mask)
++    eb_mask.scatter_(1, sorted_idx, sorted_mask)
++
++    # ---- Phase 5: Post-sample ----
++    is_commit = is_encoder_phase[decode_slots]  # [num_decode]
++    is_denoise = ~is_commit
++    cur_step = step_tensor[decode_slots].float()
++
++    # Step update: +1 for denoise, reset to 0 for commit
++    new_step_val = torch.where(
++        is_denoise,
++        (cur_step + 1).to(step_tensor.dtype),
++        step_tensor.new_zeros(num_decode),
++    )
++    step_tensor[decode_slots] = new_step_val
++
++    # Random tokens for renoise / canvas reinit
++    # Renoise draws from the whole vocabulary even for a constrained read.
++    # The model was trained on random-vocabulary noise. Noise drawn from the
++    # allowed set looks like garbled text, and later steps denoise it into
++    # more garbled text.
++    random_tokens = torch.randint(
++        0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
++    )
++
++    # Compute denoise canvas (accept/renoise). Pinned positions keep the seed.
++    denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
++    denoise_canvas = torch.where(
++        pin_mask[decode_slots], seed_canvas[decode_slots], denoise_canvas
++    )
++
++    # Canvas: commit → random reinit, denoise → accept/renoise result
++    canvas[decode_slots] = torch.where(
++        is_commit.unsqueeze(1), random_tokens, denoise_canvas
++    )
++
++    # History: write argmax_tokens for denoise requests at circular position
++    hist_len = history_len_tensor[decode_slots]
++    write_pos = hist_len % ST
++    for i in range(ST):
++        write_here = ((write_pos == i) & is_denoise).unsqueeze(1)
++        history[decode_slots, i] = torch.where(
++            write_here, argmax_tokens, history[decode_slots, i]
++        )
++
++    # Argmax canvas: update for denoise, preserve for commit
++    argmax_canvas[decode_slots] = torch.where(
++        is_denoise.unsqueeze(1), argmax_tokens, argmax_canvas[decode_slots]
++    )
++
++    # History length: increment for denoise, reset for commit
++    new_hist_len = torch.where(is_denoise, hist_len + 1, hist_len.new_zeros(num_decode))
++    history_len_tensor[decode_slots] = new_hist_len
++
++    # ---- Phase 6: Stability + convergence ----
++    ref = history[decode_slots, 0]
++    mismatch = torch.zeros(num_decode, device=device, dtype=torch.int32)
++    for h in range(1, ST):
++        mismatch = mismatch + (ref != history[decode_slots, h]).sum(dim=-1).int()
++    stable = mismatch == 0
++
++    step_after = step_tensor[decode_slots]
++    converged = (stable & confident_tensor[decode_slots] & (new_hist_len >= ST)) | (
++        step_after >= max_steps_tensor[decode_slots]
++    )
++    # Commit done → denoise next (False); denoise converged → commit next (True)
++    is_encoder_phase[decode_slots] = torch.where(
++        is_commit, is_commit.new_zeros(num_decode), converged
++    )
++
++    emit = is_commit | (is_denoise & converged & read_only[decode_slots])
++    sampled[decode_idx] = argmax_canvas[decode_slots].to(sampled.dtype) * emit[:, None]
++    num_sampled[decode_idx] = (emit * valid_canvas_len).to(num_sampled.dtype)
++
++    # SC soft embedding: store ``probs @ embed_weight`` (the value the next step's
++    # self-conditioning MLP consumes) only for slots that will denoise next — i.e.
++    # this step denoised AND it isn't about to commit (is_encoder_phase now False).
++    # Masking here (rather than in the consumer) lets _apply_self_conditioning read
++    # sc_embeds directly. Storing the [.., hidden] soft embed instead of the full
++    # [.., vocab] probs avoids a giant persistent buffer.
++    sc_keep = (is_denoise & ~is_encoder_phase[decode_slots])[:, None, None]
++    if compute_sc:
++        soft_embeds = soft_flat.view(num_decode, CL, -1) * normalizer
++        sc_pin = (~pin_mask[decode_slots]).unsqueeze(-1)
++        sc_embeds[decode_slots] = (soft_embeds * sc_keep * sc_pin).to(sc_embeds.dtype)
++    else:
++        sc_embeds[decode_slots] = 0
++
++    # Overwrite canvas with argmax for newly converged denoise requests
++    newly_converged = (converged & is_denoise).unsqueeze(1)
++    canvas[decode_slots] = torch.where(
++        newly_converged, argmax_canvas[decode_slots], canvas[decode_slots]
++    )
++    is_encoder_phase[decode_slots] &= ~read_only[decode_slots]
++
++    # ---- Phase 7: Copy canvas → draft_tokens for all slots ----
++    draft_tokens[all_slots, :CL] = canvas[all_slots]
++
++
++
+ class DiffusionGemmaRequestStates:
+     """Pre-allocated GPU tensors for DiffusionGemma per-request state.
+ 
+@@ -1409,6 +1643,75 @@
+             num_rejected=num_rejected,
+         )
+ 
++    def _djev_fused_tile(
++        self, tile_logits, tile_slots, tile_decode_idx, all_slots, tile_valid,
++        sampled, num_sampled, W, n, compute_sc, embed_weight, cap, e8, sv,
++    ) -> torch.Tensor:
++        """DJEV_FUSED_SAMPLER: fused softcap/temperature/Gumbel/argmax/entropy
++        (+ bf16 probs) kernel, the self-conditioning GEMM (FP8 if available),
++        then the compiled state update. Returns per-row 1/temperature."""
++        states = self.diffusion_states
++        msteps = float(states.max_denoising_steps)
++        steps_f = states.step[tile_slots].float()
++        remaining = (msteps - steps_f).clamp(min=1.0)
++        temp = self.t_min + (self.t_max - self.t_min) * (remaining / msteps)
++        inv_t = (1.0 / temp.clamp(min=1e-10)).repeat_interleave(W)
++        noise = (temp > 0).to(torch.int32).repeat_interleave(W)
++        x = tile_logits if tile_logits.is_contiguous() else tile_logits.contiguous()
++        seed = _djev_random.getrandbits(30)
++        nt, am, ent, lse, probs = _djev_kb.fused_vocab_step(
++            x, inv_t, noise, cap, seed, want_probs=compute_sc
++        )
++        soft = None
++        if compute_sc:
++            # FP8 SC kernel wins only for a single 128-row canvas (1.3 vs 2.0 ms);
++            # batched tiles are faster through the bf16 GEMM (measured on L40S).
++            if e8 is not None and probs.shape[0] <= 128:
++                soft = _djev_kb.sc_fp8_gemm(probs, e8, sv)
++            else:
++                soft = torch.matmul(probs, embed_weight)
++        if (
++            _DJEV_KB_PARITY
++            and _DJEV_KB["n_parity"] < _DJEV_KB_PARITY_MAX
++            and x.shape[0] <= 256
++        ):
++            ref = _djev_softcap_keep_ninf(x, cap) * inv_t[:, None]
++            lp = ref.log_softmax(-1)
++            p = lp.exp()
++            ref_ent = -(p * lp).sum(-1)
++            rec = {
++                "kind": "sampler", "rows": int(x.shape[0]), "tile_reqs": int(n),
++                "argmax_agree": float((ref.argmax(-1) == am).float().mean()),
++                "entropy_max_abs_diff": float((ref_ent - ent).abs().max()),
++                "entropy_mean": float(ref_ent.mean()),
++                "lse_max_abs_diff": float((torch.logsumexp(ref, -1) - lse).abs().max()),
++                "gumbel_eq_argmax_rate": float((nt == am).float().mean()),
++            }
++            if compute_sc:
++                pb = p.to(torch.bfloat16)
++                rec["probs_max_abs_diff"] = float((pb.float() - probs.float()).abs().max())
++                sref = torch.matmul(pb, embed_weight).float()
++                rec["sc_rel_err"] = float((soft.float() - sref).norm() / sref.norm())
++                rec["sc_worst_row_rel_err"] = float(
++                    ((soft.float() - sref).norm(dim=1) / sref.norm(dim=1).clamp(min=1e-12)).max()
++                )
++            _djev_parity_log(rec)
++        _djev_post_sample_step(
++            nt.view(n, W), am.view(n, W), ent.view(n, W), soft,
++            tile_slots, tile_decode_idx, all_slots, tile_valid,
++            states.canvas[:, :W], states.argmax_canvas[:, :W], states.step,
++            states.is_encoder_phase, states.confident,
++            states.self_conditioning_embeds[:, :W], self.normalizer,
++            states.accepted_canvas_history[:, :, :W],
++            states.accepted_canvas_history_len, states.max_steps,
++            states.pin_mask[:, :W], states.seed_canvas[:, :W], states.read_only,
++            sampled[:, :W], num_sampled, self.req_states.draft_tokens,
++            confidence_threshold=self.confidence_threshold,
++            vocab_size=self.vocab_size, CL=W, ST=states.stability_threshold,
++            entropy_bound=self.entropy_bound, compute_sc=compute_sc,
++        )
++        return inv_t
++
+     # ------------------------------------------------------------------
+     # Main entry point
+     # ------------------------------------------------------------------
+@@ -1468,6 +1771,8 @@
+                 decode_slots_np,
+             )
+             if top_k is not None or top_p is not None:
++                if logits.dtype != torch.float32 and _DJEV_KB["softcap"]:
++                    logits = _djev_softcap_keep_ninf(logits, _DJEV_KB["softcap"])
+                 logits = apply_top_k_top_p(logits.float(), top_k, top_p)
+ 
+         # Where each decode request's rows start in the flat logits. Tiles
+@@ -1501,6 +1806,8 @@
+             embed_weight = self.embed_weight[allowed]
+             sc_vocab_start, sc_vocab_end = 0, allowed.numel()
+         elif states.constrained and num_decode > 0:
++            if logits.dtype != torch.float32 and _DJEV_KB["softcap"]:
++                logits = _djev_softcap_keep_ninf(logits, _DJEV_KB["softcap"])
+             # The decode slots do not share one set, so this step runs over
+             # the full vocabulary. Mask each constrained request's rows to
+             # its own set so it reads the same as on the shared path. The
+@@ -1531,6 +1838,23 @@
+         widths_np = states.canvas_width_np[decode_slots_np]
+         order = np.argsort(widths_np, kind="stable")
+         free = current_platform.mem_get_info()[0] if num_decode > 0 else 0
++        # DJEV_FUSED_SAMPLER: raw bf16 full-vocab logits -> fused vocab kernel.
++        djev_raw_cap = (
++            _DJEV_KB["softcap"]
++            if (
++                _DJEV_FUSED_SAMPLER
++                and allowed is None
++                and logits.dtype != torch.float32
++                and self.tp_size == 1
++            )
++            else None
++        )
++        if logits.dtype != torch.float32 and djev_raw_cap is None and _DJEV_KB["softcap"]:
++            logits = _djev_softcap_keep_ninf(logits, _DJEV_KB["softcap"])
++        djev_e8 = (
++            _DJEV_KB["e8"] if (allowed is None and self.tp_size == 1) else None
++        )
++        djev_sv = _DJEV_KB["sv"] if djev_e8 is not None else None
+         run_start = 0
+         while run_start < num_decode:
+             W = int(widths_np[order[run_start]])
+@@ -1540,6 +1864,14 @@
+             # ~10 transient fp32 copies of [tile * W, vocab] inside the step
+             # (eager peaks at ~8; pad for allocator overhead and small tensors).
+             budget = max(1, int(free * 0.5) // max(W * self.vocab_size * 4 * 10, 1))
++            if djev_raw_cap is not None:
++                # fused path keeps one bf16 probs copy per row (+ logits already
++                # resident): batch the whole step's self-conditioning GEMM.
++                budget = (
++                    max(1, int(free * 0.5) // max(W * self.vocab_size * 2 * 2, 1))
++                    if _DJEV_BATCH_SC
++                    else 1
++                )
+             for t0 in range(run_start, run_end, budget):
+                 sel_np = order[t0 : min(t0 + budget, run_end)]
+                 n = len(sel_np)
+@@ -1571,7 +1903,15 @@
+                     )
+                 )
+ 
+-                scaled = _compiled_sample_step(
++                if djev_raw_cap is not None:
++                    scaled = None
++                    djev_inv_t = self._djev_fused_tile(
++                        tile_logits, tile_slots, decode_idx[sel], all_slots,
++                        tile_valid, sampled, num_sampled, W, n, compute_sc,
++                        embed_weight, djev_raw_cap, djev_e8, djev_sv,
++                    )
++                else:
++                  scaled = _compiled_sample_step(
+                     tile_logits,
+                     tile_slots,
+                     decode_idx[sel],
+@@ -1611,7 +1951,9 @@
+                     tp_group_name=self.tp_group_name,
+                     compute_sc=compute_sc,
+                     allowed=allowed,
+-                )
++                    djev_e8=djev_e8 if n * W <= 128 else None,
++                    djev_sv=djev_sv if n * W <= 128 else None,
++                  )
+ 
+                 # Stash newly converged logprobs, including reads that emit now.
+                 if want_logprobs:
+@@ -1620,6 +1962,13 @@
+                     )
+                     just_converged = converged_mask & ~is_committing[sel]
+                     if just_converged.any():
++                        if scaled is None:
++                            # fused path: build the temperature-scaled logits
++                            # only when a stash actually needs them
++                            scaled = (
++                                _djev_softcap_keep_ninf(tile_logits, djev_raw_cap)
++                                * djev_inv_t[:, None]
++                            ).view(n, W, -1)
+                         flat_logits = scaled.reshape(-1, scaled.shape[-1])
+                         argmax_tokens = scaled.argmax(dim=-1)
+                         raw_flat: torch.Tensor | None = None
+@@ -1635,7 +1984,11 @@
+                                 # Read-only slots report logprobs at temperature 1.
+                                 # The schedule-tempered logits share the argmax.
+                                 if raw_flat is None:
+-                                    raw_flat = tile_logits.float()
++                                    raw_flat = (
++                                        _djev_softcap_keep_ninf(tile_logits, djev_raw_cap)
++                                        if djev_raw_cap is not None
++                                        else tile_logits.float()
++                                    )
+                                 src = raw_flat
+                             if allowed is not None:
+                                 # Column j of the K-space logits is allowed[j]:
+--- /dev/null	2026-10-07 17:21:49.565858098 +0000
++++ b/vllm/model_executor/models/djev_kb_kernels.py	2026-10-13 21:01:44.577834244 +0000
+@@ -0,0 +1,205 @@
++# SPDX-License-Identifier: Apache-2.0
++"""djev thinking-path kernels (DJEV_FP8_LMHEAD / DJEV_FUSED_SAMPLER).
++
++* fused_vocab_step(): one Triton pass over the [rows, vocab] logits computes, per row,
++  softcap -> /temperature -> argmax, Gumbel-max sample, logsumexp and entropy (split-row
++  partials + a tiny torch reduce); an optional second pass writes probs in bf16 for the
++  self-conditioning GEMM.  Replaces the fp32 softcap kernel + the vocab part of
++  _compiled_sample_step (~10 fp32 [rows, vocab] temporaries).
++* sc_fp8_gemm(): self-conditioning soft embedding probs[M, V] @ E[V, H] with E stored in
++  FP8 e4m3 (per-vocab-row scale), bf16 activations (W8A16, split-K Triton, fp32 atomics).
++* build_fp8_embedding(): per-row FP8 copy of the tied embedding (built in chunks).
++"""
++import torch
++
++from vllm.triton_utils import tl, triton
++
++_NEG_INF = tl.constexpr(float("-inf"))
++
++
++@triton.jit
++def _vocab_pass1(x_ptr, inv_t_ptr, noise_ptr, part_ptr, V, seed, softcap,
++                 APPLY_SOFTCAP: tl.constexpr, CHUNK: tl.constexpr, BLOCK: tl.constexpr,
++                 NCH: tl.constexpr):
++    r = tl.program_id(0)
++    c = tl.program_id(1)
++    inv_t = tl.load(inv_t_ptr + r)
++    use_noise = tl.load(noise_ptr + r)
++    m = tl.full([BLOCK], _NEG_INF, tl.float32)
++    s = tl.zeros([BLOCK], tl.float32)
++    t = tl.zeros([BLOCK], tl.float32)
++    best_s = tl.full([BLOCK], _NEG_INF, tl.float32)
++    idx_s = tl.zeros([BLOCK], tl.int32)
++    best_n = tl.full([BLOCK], _NEG_INF, tl.float32)
++    idx_n = tl.zeros([BLOCK], tl.int32)
++    row_ptr = x_ptr + r.to(tl.int64) * V
++    base = c * CHUNK
++    for off in range(0, CHUNK, BLOCK):
++        cols = base + off + tl.arange(0, BLOCK)
++        valid = cols < V
++        x = tl.load(row_ptr + cols, mask=valid, other=_NEG_INF).to(tl.float32)
++        if APPLY_SOFTCAP:
++            # tanh(x / cap) * cap, keeping -inf (grammar/top-k masks) as -inf
++            e2 = tl.exp(2.0 * x / softcap)
++            xc = softcap * (1.0 - 2.0 / (e2 + 1.0))
++            x = tl.where(x == _NEG_INF, _NEG_INF, xc)
++        x = x * inv_t
++        u = tl.maximum(tl.rand(seed + r, cols), 1e-20)
++        nz = x + tl.where(use_noise != 0, -tl.log(-tl.log(u)), 0.0)
++        upd = x > best_s
++        best_s = tl.where(upd, x, best_s)
++        idx_s = tl.where(upd, cols, idx_s)
++        upd = nz > best_n
++        best_n = tl.where(upd, nz, best_n)
++        idx_n = tl.where(upd, cols, idx_n)
++        m_new = tl.maximum(m, x)
++        m_safe = tl.where(m_new == _NEG_INF, 0.0, m_new)
++        a = tl.exp(m - m_safe)
++        b = tl.exp(x - m_safe)
++        xb = tl.where(x == _NEG_INF, 0.0, x)
++        s = s * a + b
++        t = t * a + b * xb
++        m = m_new
++    M = tl.max(m, 0)
++    M_safe = tl.where(M == _NEG_INF, 0.0, M)
++    sc = tl.exp(m - M_safe)
++    S = tl.sum(s * sc, 0)
++    T = tl.sum(t * sc, 0)
++    BS = tl.max(best_s, 0)
++    IS = tl.min(tl.where(best_s == BS, idx_s, 2147483647), 0)
++    BN = tl.max(best_n, 0)
++    IN = tl.min(tl.where(best_n == BN, idx_n, 2147483647), 0)
++    o = part_ptr + (r * NCH + c) * 7
++    tl.store(o + 0, M)
++    tl.store(o + 1, S)
++    tl.store(o + 2, T)
++    tl.store(o + 3, BS)
++    tl.store(o + 4, IS.to(tl.float32))
++    tl.store(o + 5, BN)
++    tl.store(o + 6, IN.to(tl.float32))
++
++
++@triton.jit
++def _vocab_pass2(x_ptr, inv_t_ptr, lse_ptr, p_ptr, V, softcap,
++                 APPLY_SOFTCAP: tl.constexpr, CHUNK: tl.constexpr, BLOCK: tl.constexpr):
++    r = tl.program_id(0)
++    c = tl.program_id(1)
++    inv_t = tl.load(inv_t_ptr + r)
++    lse = tl.load(lse_ptr + r)
++    row = r.to(tl.int64) * V
++    for off in range(0, CHUNK, BLOCK):
++        cols = c * CHUNK + off + tl.arange(0, BLOCK)
++        valid = cols < V
++        x = tl.load(x_ptr + row + cols, mask=valid, other=_NEG_INF).to(tl.float32)
++        if APPLY_SOFTCAP:
++            e2 = tl.exp(2.0 * x / softcap)
++            xc = softcap * (1.0 - 2.0 / (e2 + 1.0))
++            x = tl.where(x == _NEG_INF, _NEG_INF, xc)
++        p = tl.exp(x * inv_t - lse)
++        tl.store(p_ptr + row + cols, p.to(tl.bfloat16), mask=valid)
++
++
++def fused_vocab_step(logits: torch.Tensor, inv_temp_rows: torch.Tensor,
++                     noise_rows: torch.Tensor, softcap: float | None, seed: int,
++                     want_probs: bool, nch: int = 32, block: int = 1024):
++    """logits [R, V] (bf16 raw if softcap is not None, else already softcapped).
++    Returns (gumbel_argmax[R] int64, argmax[R] int64, entropy[R] f32, lse[R] f32,
++             probs[R, V] bf16 or None)."""
++    R, V = logits.shape
++    assert logits.is_contiguous()
++    chunk = triton.cdiv(triton.cdiv(V, nch), block) * block
++    nch = triton.cdiv(V, chunk)
++    part = torch.empty(R, nch, 7, device=logits.device, dtype=torch.float32)
++    apply_sc = softcap is not None
++    cap = float(softcap) if apply_sc else 1.0
++    _vocab_pass1[(R, nch)](logits, inv_temp_rows, noise_rows, part, V, seed, cap,
++                           APPLY_SOFTCAP=apply_sc, CHUNK=chunk, BLOCK=block, NCH=nch,
++                           num_warps=4)
++    Mx = part[..., 0].amax(1, keepdim=True)
++    w = torch.exp(part[..., 0] - Mx)
++    S = (part[..., 1] * w).sum(1)
++    T = (part[..., 2] * w).sum(1)
++    lse = Mx.squeeze(1) + torch.log(S)
++    ent = lse - T / S
++    am = part[..., 4].gather(1, part[..., 3].argmax(1, keepdim=True)).squeeze(1).long()
++    nt = part[..., 6].gather(1, part[..., 5].argmax(1, keepdim=True)).squeeze(1).long()
++    probs = None
++    if want_probs:
++        probs = torch.empty(R, V, device=logits.device, dtype=torch.bfloat16)
++        _vocab_pass2[(R, nch)](logits, inv_temp_rows, lse.contiguous(), probs, V, cap,
++                               APPLY_SOFTCAP=apply_sc, CHUNK=chunk, BLOCK=block,
++                               num_warps=4)
++    return nt, am, ent, lse, probs
++
++
++@triton.jit
++def _sc_fp8_kernel(a_ptr, b_ptr, s_ptr, c_ptr, M, N, K,
++                   stride_am, stride_bk, stride_cm, NUM_N,
++                   SPLIT_K: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
++                   BLOCK_K: tl.constexpr):
++    # grid = (NUM_N * NUM_M, NUM_K): all (n, m) tiles of one K split run back to back, so
++    # the K-slice of E (fp8) and of probs stay in L2 and E is read from DRAM ~once.
++    pid = tl.program_id(0)
++    pid_k = tl.program_id(1)
++    pid_n = pid % NUM_N
++    pid_m = pid // NUM_N
++    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
++    k0 = pid_k * SPLIT_K
++    for kk in range(0, SPLIT_K, BLOCK_K):
++        rk = k0 + kk + tl.arange(0, BLOCK_K)
++        km = rk < K
++        a = tl.load(a_ptr + rm[:, None].to(tl.int64) * stride_am + rk[None, :],
++                    mask=(rm[:, None] < M) & km[None, :], other=0.0)
++        b = tl.load(b_ptr + rk[:, None].to(tl.int64) * stride_bk + rn[None, :],
++                    mask=km[:, None] & (rn[None, :] < N), other=0.0)
++        sv = tl.load(s_ptr + rk, mask=km, other=0.0)
++        b = (b.to(tl.float32) * sv[:, None]).to(tl.bfloat16)
++        acc += tl.dot(a, b)
++    tl.atomic_add(c_ptr + rm[:, None].to(tl.int64) * stride_cm + rn[None, :], acc,
++                  mask=(rm[:, None] < M) & (rn[None, :] < N), sem="relaxed")
++
++
++def sc_fp8_gemm(probs: torch.Tensor, e8: torch.Tensor, sv: torch.Tensor,
++                split_k: int = 4096, block_n: int = 128, block_k: int = 64) -> torch.Tensor:
++    """probs [M, V] bf16 @ (e8 [V, H] fp8 * sv[V, None]) -> [M, H] fp32."""
++    M, K = probs.shape
++    K2, N = e8.shape
++    assert K == K2 and probs.is_contiguous() and e8.is_contiguous()
++    out = torch.zeros(M, N, device=probs.device, dtype=torch.float32)
++    if M == 0:
++        return out
++    bm = 128 if M > 64 else (64 if M > 32 else (32 if M > 16 else 16))
++    nw = 8 if bm == 128 else 4
++    num_n = triton.cdiv(N, block_n)
++    grid = (num_n * triton.cdiv(M, bm), triton.cdiv(K, split_k))
++    _sc_fp8_kernel[grid](probs, e8, sv, out, M, N, K, probs.stride(0), e8.stride(0),
++                         out.stride(0), num_n, SPLIT_K=split_k, BLOCK_M=bm,
++                         BLOCK_N=block_n, BLOCK_K=block_k, num_warps=nw, num_stages=3)
++    return out
++
++
++@torch.library.custom_op("djev_kb::sc_fp8_gemm", mutates_args=())
++def sc_fp8_gemm_op(probs: torch.Tensor, e8: torch.Tensor, sv: torch.Tensor) -> torch.Tensor:
++    return sc_fp8_gemm(probs.contiguous(), e8, sv)
++
++
++@sc_fp8_gemm_op.register_fake
++def _(probs, e8, sv):
++    return probs.new_empty((probs.shape[0], e8.shape[1]), dtype=torch.float32)
++
++
++@torch.no_grad()
++def build_fp8_embedding(weight: torch.Tensor, rows_per_chunk: int = 16384):
++    """Per-row (per-vocab-entry) FP8 e4m3 copy of a [V, H] bf16 matrix, built in chunks so
++    the fp32 temporaries stay small.  Returns (e8 [V, H] fp8, scale [V] fp32)."""
++    V, H = weight.shape
++    e8 = torch.empty(V, H, device=weight.device, dtype=torch.float8_e4m3fn)
++    sv = torch.empty(V, device=weight.device, dtype=torch.float32)
++    for r0 in range(0, V, rows_per_chunk):
++        w = weight[r0:r0 + rows_per_chunk].float()
++        s = (w.abs().amax(1) / 448.0).clamp(min=1e-12)
++        e8[r0:r0 + rows_per_chunk] = (w / s[:, None]).to(torch.float8_e4m3fn)
++        sv[r0:r0 + rows_per_chunk] = s
++    return e8, sv
