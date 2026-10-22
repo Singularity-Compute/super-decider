@@ -313,7 +313,7 @@
 +        soft = None
 +        if compute_sc:
 +            # FP8 SC kernel wins only for a single 128-row canvas (1.3 vs 2.0 ms);
-+            # batched tiles are faster through the bf16 GEMM (measured on L40S).
++            # batched tiles are faster through the bf16 GEMM.
 +            if e8 is not None and probs.shape[0] <= 128:
 +                soft = _djev_kb.sc_fp8_gemm(probs, e8, sv)
 +            else:

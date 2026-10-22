@@ -104,7 +104,7 @@
          launch_num_stages = 2
  
 +    # Ada (SM89) prefill / canvas tuning for Gemma4-style heads (256 / 512).
-+    # Measured on L40S: 1.5-1.9x faster, bit-identical outputs (TILE stays 32;
++    # Measured: 1.5-1.9x faster, bit-identical outputs (TILE stays 32;
 +    # BLOCK_M=64 or 3 stages overflow the 99 KB smem limit for head 512).
 +    if (
 +        not tuned_large_head

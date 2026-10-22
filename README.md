@@ -27,7 +27,7 @@ Super Decider is built for the decisions inside your software: which team gets t
 
 - **Open weights, Jev-compatible API.** Run it yourself or call our hosted endpoint. Moving from Jev means changing the URL and the model name.
 - **Thinks only where it needs to.** Easy questions are answered in one pass. When the model is unsure, it writes a short thought first. Set `"thinking": "always"` to reason through every question.
-- **Fast and cheap by design.** A diffusion model reads every answer slot in one step, and its mixture-of-experts backbone runs 4B of 26B parameters per decision: about 0.1 s on one NVIDIA L40S, $0.03 per million input tokens with output free.
+- **Fast and cheap by design.** A diffusion model reads every answer slot in one step, and its mixture-of-experts backbone runs 4B of 26B parameters per decision: about 0.1 s per decision on a single GPU, $0.03 per million input tokens with output free.
 
 ## Benchmarks
 
@@ -110,7 +110,7 @@ curl localhost:8011/v1/systemone -H 'Content-Type: application/json' \
   -d '{"state": "Order 8812 shipped Oct 1; the customer wants to cancel.", "questions": {"allowed": {"type": "noul", "instructions": "Is cancelling allowed?"}}}'
 ```
 
-The container needs a 48 GB GPU (tested on L40S) and downloads the [weights](https://huggingface.co/Singularity-Compute/super-decider) (NVFP4, 18 GB) on first start. Set `-e API_KEY=...` to require a bearer token. Defaults live in [`runtime/Dockerfile`](runtime/Dockerfile); [`runtime/run.sh`](runtime/run.sh) runs the same setup without Docker.
+The container needs a GPU with 48 GB of memory and downloads the [weights](https://huggingface.co/Singularity-Compute/super-decider) (NVFP4, 18 GB) on first start. Set `-e API_KEY=...` to require a bearer token. Defaults live in [`runtime/Dockerfile`](runtime/Dockerfile); [`runtime/run.sh`](runtime/run.sh) runs the same setup without Docker.
 
 ## Where to use it
 
