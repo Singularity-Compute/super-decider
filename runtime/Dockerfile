@@ -20,7 +20,7 @@ ENV MODEL_ID=Singularity-Compute/super-decider \
     DJEV_MANY_OPTIONS=chunk=20,top=3,think1=0,think2=0 \
     DEFAULT_SAMPLES=1 SERVER_EXTRA_ARGS=--constrained \
     MAX_LEN=131072 KV_DTYPE=fp8 KV_BYTES=17179869184 CANVAS=128 MAX_SEQS=64 \
-    API_SERVERS=8 FP8_DENSE=1 WARMUP=1 VISION=1 MAX_IMAGES=8 \
-    API_KEY=local
+    API_SERVERS=8 FP8_DENSE=1 WARMUP=1 VISION=1 MAX_IMAGES=8
+# Set API_KEY (-e API_KEY=...) to require "Authorization: Bearer <key>" on every POST; unset means no auth.
 EXPOSE 8011
 ENTRYPOINT ["/cfg/entrypoint.sh"]

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Hosted API access
+    url: https://asicloud.cudos.org/
+    about: Get a key for the hosted endpoint on ASI:Cloud.
+  - name: Talk to the team
+    url: mailto:tech@singularitycompute.com
+    about: Pricing, volume, private deployments.

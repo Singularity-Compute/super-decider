@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="300" viewBox="0 0 880 300" role="img" aria-label="A Super Decider request and its answer: start_return 0.96, refund_now 0.02, escalate 0.02; cancelling allowed: yes 0.03">
+  <style>
+    :root { --bg: #ffffff; --panel: #f6f7f9; --line: #e2e4ea; --text: #111111; --muted: #6b6f7b; --accent: #5634f8; --track: #e9e8f3; --key: #5634f8; --str: #1d7a55; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3; --muted: #8b949e; --accent: #8f7bff; --track: #262a40; --key: #a99bff; --str: #7ee2b8; }
+    }
+    .bg { fill: var(--bg); }
+    .panel { fill: var(--panel); stroke: var(--line); }
+    .mono { font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: var(--text); }
+    .k { fill: var(--key); } .s { fill: var(--str); } .m { fill: var(--muted); }
+    .label { font: 600 12px -apple-system, Segoe UI, Helvetica, Arial, sans-serif; fill: var(--muted); letter-spacing: .06em; }
+    .opt { font: 14px -apple-system, Segoe UI, Helvetica, Arial, sans-serif; fill: var(--text); }
+    .val { font: 600 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: var(--text); }
+    .track { fill: var(--track); }
+    .bar { fill: var(--accent); transform-box: fill-box; transform-origin: left center; transform: scaleX(0); animation: grow 6s ease-out infinite; }
+    .b2 { animation-delay: .15s; } .b3 { animation-delay: .3s; } .b4 { animation-delay: .5s; }
+    .fade { opacity: 0; animation: fade 6s ease-out infinite; }
+    .f2 { animation-delay: .15s; } .f3 { animation-delay: .3s; } .f4 { animation-delay: .5s; }
+    @keyframes grow { 0%, 12% { transform: scaleX(0); } 30%, 88% { transform: scaleX(1); } 100% { transform: scaleX(0); } }
+    @keyframes fade { 0%, 20% { opacity: 0; } 32%, 88% { opacity: 1; } 100% { opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) { .bar { animation: none; transform: scaleX(1); } .fade { animation: none; opacity: 1; } }
+  </style>
+  <rect class="bg" width="880" height="300" rx="14"/>
+
+  <rect class="panel" x="16" y="16" width="452" height="268" rx="10"/>
+  <text class="label" x="36" y="44">REQUEST · POST /v1/systemone</text>
+  <text class="mono" x="36" y="76"><tspan class="k">"state"</tspan>: <tspan class="s">"Order 8812 shipped on Oct 1. The</tspan></text>
+  <text class="mono" x="36" y="96"><tspan class="s">  customer wants to cancel and get a</tspan></text>
+  <text class="mono" x="36" y="116"><tspan class="s">  refund. Policy: shipped orders can be</tspan></text>
+  <text class="mono" x="36" y="136"><tspan class="s">  returned within 30 days."</tspan>,</text>
+  <text class="mono" x="36" y="166"><tspan class="k">"next_step"</tspan>: choice of</text>
+  <text class="mono" x="36" y="186">  <tspan class="s">refund_now</tspan> · <tspan class="s">start_return</tspan> · <tspan class="s">escalate</tspan></text>
+  <text class="mono" x="36" y="216"><tspan class="k">"allowed"</tspan>: yes or no</text>
+  <text class="mono m" x="36" y="236">  Is cancelling this order allowed?</text>
+  <text class="mono m" x="36" y="266">~0.25 s, one call, no text to parse</text>
+
+  <rect class="panel" x="484" y="16" width="380" height="268" rx="10"/>
+  <text class="label" x="504" y="44">ANSWER</text>
+  <text class="opt" x="504" y="78">next_step</text>
+
+  <text class="opt" x="504" y="108">start_return</text>
+  <rect class="track" x="620" y="97" width="170" height="14" rx="7"/>
+  <rect class="bar" x="620" y="97" width="163" height="14" rx="7"/>
+  <text class="val fade" x="800" y="109">0.96</text>
+
+  <text class="opt" x="504" y="138">refund_now</text>
+  <rect class="track" x="620" y="127" width="170" height="14" rx="7"/>
+  <rect class="bar b2" x="620" y="127" width="4" height="14" rx="2"/>
+  <text class="val fade f2" x="800" y="139">0.02</text>
+
+  <text class="opt" x="504" y="168">escalate</text>
+  <rect class="track" x="620" y="157" width="170" height="14" rx="7"/>
+  <rect class="bar b3" x="620" y="157" width="4" height="14" rx="2"/>
+  <text class="val fade f3" x="800" y="169">0.02</text>
+
+  <text class="opt" x="504" y="214">allowed</text>
+  <text class="opt" x="504" y="244">yes</text>
+  <rect class="track" x="620" y="233" width="170" height="14" rx="7"/>
+  <rect class="bar b4" x="620" y="233" width="5" height="14" rx="2"/>
+  <text class="val fade f4" x="800" y="245">0.03</text>
+</svg>

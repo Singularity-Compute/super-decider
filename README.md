@@ -1,40 +1,152 @@
-# super-decider
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark-bg.svg">
+    <img src="assets/logo-light-bg.svg" alt="Singularity Compute" height="72">
+  </picture>
+</p>
 
-super-decider answers typed questions about a state: `choice`, yes/no (`noul`) and `score`, each with a calibrated
-probability distribution, in one call. It is a fine-tune of Google's DiffusionGemma 26B-A4B (discrete-diffusion MoE,
-4B active parameters) that reads every answer slot in one denoising step and runs on one NVIDIA L40S.
+<h1 align="center">Super Decider</h1>
 
-- API: the Jev / TypeSafe "System One" request format (`POST /v1/systemone`) and OpenAI-compatible chat completions;
-  text, JSON and up to 8 images per request. Reference: [`docs/API.md`](docs/API.md).
-- Runtime: stock vLLM (pinned nightly), small vLLM patches (each question's prompt block read in both directions,
-  faster attention on Ada GPUs, a faster thinking path) and a thin structured server, in [`runtime/`](runtime/).
-- Weights and model card: [Singularity-Compute/super-decider](https://huggingface.co/Singularity-Compute/super-decider)
-  on Hugging Face (NVFP4, 18 GB).
-- Licences: [`LICENSE`](LICENSE) (Apache-2.0), [`NOTICE.md`](NOTICE.md).
+<p align="center">
+  The open-weights decision model that thinks when it's unsure.<br>
+  Send a state and typed questions, get back a choice, a yes or no, or a score, with a calibrated probability for every answer.
+</p>
 
-## How it works
-- **Fine-tuned for decisions.** DiffusionGemma 26B-A4B is fine-tuned on permissively licensed and synthetic decision
-  data, then merged into NVIDIA's NVFP4 checkpoint.
-- **One-step reads.** All answer slots of a request are filled in one denoising step, so several questions cost little
-  more than one.
-- **Bidirectional attention within each question.** The prompt block of every question is read in both directions, not
-  only left to right. The model was trained this way, and the runtime applies the same attention through a small vLLM
-  patch (`DJEV_BIDIR_SERVE=1`, `DJEV_BIDIR=qsep`).
-- **Adaptive thinking.** When the model is unsure of an answer, it writes a short thought and reads the answer again.
-  A request can turn this off, keep it on under load, or think on every question with `"thinking"` (see
-  [`docs/API.md`](docs/API.md)).
+<p align="center">
+  <a href="https://huggingface.co/Singularity-Compute/super-decider"><img alt="Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-weights-ffd21e"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <a href="https://asicloud.cudos.org/"><img alt="Hosted on ASI:Cloud" src="https://img.shields.io/badge/hosted-ASI%3ACloud-5634f8"></a>
+  <a href="docs/API.md"><img alt="API: Jev System One compatible" src="https://img.shields.io/badge/API-Jev%20System%20One-111111"></a>
+</p>
 
-## Run it
+<p align="center">
+  <img src="assets/demo.svg" alt="A Super Decider request and its answer with a probability for every option" width="880">
+</p>
+
+Super Decider is built for the decisions inside your software: which team gets this ticket, is this email phishing, can the agent run this tool call, does this invoice add up. It never writes prose, so there is nothing to parse. Your code reads the probability and decides whether to act, ask a person or try a bigger model.
+
+- **Open weights, Jev-compatible API.** Run it yourself or call our hosted endpoint. Moving from Jev means changing the URL and the model name.
+- **Thinks only where it needs to.** Easy questions are answered in one pass. When the model is unsure, it writes a short thought first. Set `"thinking": "always"` to reason through every question.
+- **Fast and cheap by design.** A diffusion model reads every answer slot in one step, and its mixture-of-experts backbone runs 4B of 26B parameters per decision: about 0.1 s on one NVIDIA L40S, $0.03 per million input tokens with output free.
+
+## Benchmarks
+
+| Benchmark | Super Decider | Jev 1.14 | Clef |
+|---|---|---|---|
+| [When2Call](https://arxiv.org/abs/2504.18851): call a tool, ask, or decline | **85.6** | 81.7 | 72.5 |
+| [PhishNChips](https://github.com/R-Lit/PhishNChips): should an email agent follow this link | **85.9** | 83.8 | 79.4 |
+| [BFCL tool selection](https://gorilla.cs.berkeley.edu/leaderboard.html): which functions to call | 96.9 | 96.4 | **98.5** |
+| [DecisionBench](https://github.com/Hanno-Labs/decision-bench): 23,900 decisions | **75.1** | 72.0 (Jev 1.13) | – |
+
+When2Call, PhishNChips and BFCL are the versions in the [Jev Decision Index 0.3](https://huggingface.co/spaces/multimodalart/jev-decision-index). We ran Super Decider on every row of each task with the Decision Index kit; Jev and Clef scores come from the public leaderboards. On our own held-out set of 1,119 long documents from domains not seen in training, Super Decider scores 94.5% with no drop on documents over 8k tokens.
+
+## Quickstart
+
+### Hosted API
+
+Get a key on [ASI:Cloud](https://asicloud.cudos.org/) or write to [tech@singularitycompute.com](mailto:tech@singularitycompute.com).
+
+```bash
+curl https://llm.a.singularitycompute.com/v1/systemone \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "model": "super-decider",
+    "state": "Order 8812 shipped on Oct 1. The customer writes: \"I want to cancel and get my money back.\" Policy: shipped orders cannot be cancelled; they can be returned within 30 days of delivery for a full refund.",
+    "questions": {
+      "next_step": {"type": "choice", "instructions": "What should support do next?",
+                    "criteria": {"refund_now": "Refund without a return", "start_return": "Start a return", "escalate": "Hand over to a human"}},
+      "allowed":   {"type": "noul", "instructions": "Is cancelling this order allowed by the policy?"},
+      "urgency":   {"type": "score", "instructions": "How urgent is this ticket?", "criteria": ["low", "medium", "high"]}
+    }
+  }'
+```
+```json
+{"answers": {
+  "next_step": {"type": "choice", "choice": "start_return",
+                "probabilities": {"refund_now": 0.02, "start_return": 0.96, "escalate": 0.02}, "confidence": 0.96},
+  "allowed":   {"type": "noul", "noul": 0.03},
+  "urgency":   {"type": "score", "score": 0.59, "legend": {"0": "low", "1": "medium", "2": "high"},
+                "probabilities": {"0": 0.43, "1": 0.54, "2": 0.02}, "confidence": 0.54}},
+ "model": "super-decider", "usage": {"input_tokens": ..., "output_tokens": ...}}
+```
+
+### With thinking on
+Add `"thinking": "always"` when the answer needs a calculation or several steps. The model writes a short thought before
+answering; the thought itself is not returned.
+```bash
+curl https://llm.a.singularitycompute.com/v1/systemone \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "model": "super-decider",
+    "thinking": "always",
+    "state": "Invoice total 1,240 EUR. The customer paid 2 x 400 EUR and 1 x 340 EUR.",
+    "questions": {
+      "paid":      {"type": "noul", "instructions": "Is the invoice fully paid?"},
+      "next_step": {"type": "choice", "instructions": "What should accounts receivable do next?",
+                    "criteria": {"close": "Mark as paid and close", "remind": "Send a reminder for the remaining amount",
+                                 "escalate": "Hand over to collections"}}
+    }
+  }'
+```
+```json
+{"model": "super-decider",
+ "answers": {
+  "paid":      {"type": "noul", "noul": 0.02},
+  "next_step": {"type": "choice", "choice": "remind",
+                "probabilities": {"close": 0.01, "remind": 0.97, "escalate": 0.01}, "confidence": 0.97}},
+ "usage": {"input_tokens": 394, "output_tokens": 240}}
+```
+The same request with `"thinking": "off"` answers in 0.27 s instead of 0.72 s, but less surely: `paid` 0.20 and
+`remind` 0.80.
+
+The same endpoint speaks OpenAI chat completions, so the OpenAI SDK works with a different base URL. See [`examples/`](examples/) for Python, the OpenAI SDK, batch calls and a confidence threshold that escalates to a person, and [`docs/API.md`](docs/API.md) for the full reference: question types, thinking modes, images and errors.
+
+### Run it yourself
+
 ```bash
 docker build -t super-decider runtime/
-docker run --gpus all -p 8011:8011 -v $PWD/models:/data/models -e MODEL_ID=Singularity-Compute/super-decider super-decider
-curl localhost:8011/v1/systemone -H 'Authorization: Bearer local' -H 'Content-Type: application/json' \
-  -d '{"state":"Order 8812 shipped Oct 1; the customer wants to cancel.","questions":{"allowed":{"type":"noul","instructions":"Is cancelling allowed?"}}}'
+docker run --gpus all -p 8011:8011 -v $PWD/models:/data/models super-decider
+curl localhost:8011/v1/systemone -H 'Content-Type: application/json' \
+  -d '{"state": "Order 8812 shipped Oct 1; the customer wants to cancel.", "questions": {"allowed": {"type": "noul", "instructions": "Is cancelling allowed?"}}}'
 ```
-The container needs a 48 GB GPU (L40S, A6000, H100) and downloads the weights on first start. Defaults are set in
-`runtime/Dockerfile`; override them with `-e`. `runtime/run.sh` runs the same setup without Docker and patches the
-installed vLLM in place.
 
-## Training
-The model was fine-tuned on permissively licensed and synthetic decision data and merged into NVIDIA's NVFP4
-checkpoint. No benchmark test items were used for training.
+The container needs a 48 GB GPU (tested on L40S) and downloads the [weights](https://huggingface.co/Singularity-Compute/super-decider) (NVFP4, 18 GB) on first start. Set `-e API_KEY=...` to require a bearer token. Defaults live in [`runtime/Dockerfile`](runtime/Dockerfile); [`runtime/run.sh`](runtime/run.sh) runs the same setup without Docker.
+
+## Where to use it
+
+| Job | Questions you might ask |
+|---|---|
+| Support routing | Which team owns this ticket? How urgent is it? Is the customer about to churn? |
+| Agent guardrails | Should the agent call this tool, ask a follow-up, or stop? Does this action need approval? |
+| Moderation and safety | Does this message break the policy? Is this email phishing? |
+| Document checks | Is this invoice complete? Does the total match the line items? Is this contract clause allowed? |
+| Model routing | Can a small model handle this request, or does it need a large one? |
+
+## How it works
+
+- **Fine-tuned for decisions.** Google's DiffusionGemma 26B-A4B is fine-tuned on permissively licensed and synthetic decision data, then merged into NVIDIA's NVFP4 checkpoint.
+- **One-step reads.** All answer slots of a request are filled in one denoising step, so several questions cost little more than one.
+- **Bidirectional attention within each question.** The prompt block of every question is read in both directions, so the model sees the question and all its options at once. The model was trained this way, and the runtime applies the same attention through a small vLLM patch.
+- **Adaptive thinking.** When the model is unsure of an answer, it writes a short thought and reads the answer again. A request can turn this off, keep it on under load, or think on every question.
+
+## Limitations
+
+- English is the primary language. Other languages work, but less well.
+- Image questions are supported (up to 8 images per request), but the model was not fine-tuned on images.
+- Thinking adds about 0.5 to 2 s to a request.
+- Self-hosting needs one 48 GB GPU.
+
+## Citation
+
+```bibtex
+@software{super_decider_2026,
+  title  = {Super Decider: an open-weights decision model},
+  author = {{Singularity Compute}},
+  year   = {2026},
+  url    = {https://github.com/Singularity-Compute/super-decider}
+}
+```
+
+## License
+
+Apache-2.0, see [`LICENSE`](LICENSE) and [`NOTICE.md`](NOTICE.md). Built by [Singularity Compute](https://singularitycompute.com/) · [X](https://x.com/S_Compute) · [LinkedIn](https://www.linkedin.com/company/scompute/)

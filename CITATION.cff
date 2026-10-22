@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use Super Decider, please cite it as below."
+title: "Super Decider: an open-weights decision model"
+type: software
+authors:
+  - name: "Singularity Compute"
+    website: "https://singularitycompute.com/"
+repository-code: "https://github.com/Singularity-Compute/super-decider"
+url: "https://huggingface.co/Singularity-Compute/super-decider"
+license: Apache-2.0
+date-released: "2026-10-15"
+keywords:
+  - decision model
+  - System One
+  - Jev
+  - diffusion language model
+  - calibration

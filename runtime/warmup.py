@@ -18,7 +18,7 @@ def qs(k):
     return out
 def post(body):
     req = urllib.request.Request(f"http://127.0.0.1:{P}/v1/systemone", data=json.dumps(body).encode(),
-                                 headers={"content-type": "application/json", "authorization": "Bearer " + os.environ.get("API_KEY", "local")})
+                                 headers={"content-type": "application/json", **({"authorization": "Bearer " + os.environ["API_KEY"]} if os.environ.get("API_KEY") else {})})
     urllib.request.urlopen(req, timeout=600).read()
 t0 = time.time()
 for conc in (1, 2, 4, 8, 16, 32):

@@ -12,7 +12,7 @@ export DJEV_ADAPTIVE_THINK=${DJEV_ADAPTIVE_THINK:-choice=0.7,score=0.7,noul=0.85
 export DJEV_THINK_STEPS=${DJEV_THINK_STEPS:-8} DJEV_MANY_OPTIONS=${DJEV_MANY_OPTIONS:-chunk=20,top=3,think1=0,think2=0}
 export DEFAULT_SAMPLES=${DEFAULT_SAMPLES:-1} SERVER_EXTRA_ARGS=${SERVER_EXTRA_ARGS:---constrained}
 export MAX_LEN=${MAX_LEN:-131072} API_SERVERS=${API_SERVERS:-8} FP8_DENSE=${FP8_DENSE:-1} WARMUP=${WARMUP:-1}
-export VISION=${VISION:-1} MAX_IMAGES=${MAX_IMAGES:-8} API_KEY=${API_KEY:-local}
+export VISION=${VISION:-1} MAX_IMAGES=${MAX_IMAGES:-8} API_KEY=${API_KEY:-}
 mkdir -p /cfg 2>/dev/null || true
 for f in structured_server.py warmup.py patch_vllm_bidir.py djev_attn_sm89.diff djev_think_sampler.diff; do ln -sf "$PWD/$f" /cfg/$f; done
 exec bash ./entrypoint.sh
