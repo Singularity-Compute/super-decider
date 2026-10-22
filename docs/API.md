@@ -13,11 +13,12 @@ All responses below are real outputs of the model, rounded.
 
 Limits: 131,072 tokens and up to 64 questions per request, up to 8 images. `choice` questions can have more than 26
 options (tested up to 151); they are read in chunks. Images go as data URLs inside the JSON body; multipart uploads are
-not supported. Image requests never think. Typical latency is about 0.25 s per request without thinking.
+not supported. Typical latency is about 0.25 s per request without thinking.
 
 To control thinking per request, add `"thinking"` to the body: `"off"`, `"auto"` (the default: a short thought only on
 uncertain questions, skipped when the server is busy), `"auto_forced"` (the same, but never skipped under load) or
-`"always"` (every question gets a thought first). `"thinking_budget"` sets the thought length in tokens (16 to 4096; the
+`"always"` (every question gets a thought first). `"auto"` and `"auto_forced"` think only on text requests with at most
+2 questions; with images or more questions, use `"always"` to get a thought. `"thinking_budget"` sets the thought length in tokens (16 to 4096; the
 default is 512). Thinking raises accuracy on multi-step questions and costs about 0.5 to 2 s per request; on plain
 classification it does not help. A too-long state returns 400 with the reason.
 
@@ -161,9 +162,11 @@ r = client.chat.completions.create(model="super-decider", messages=[
 | Status | When | Body |
 |---|---|---|
 | 400 | `model` missing | `{"error": "Model name not provided"}` |
+| 400 | unknown `model` name (for example `jev-latest`) | `{"error": "Model not found"}` |
 | 400 / 422 | invalid request: unknown `thinking` value, bad question shape, state too long | `{"error": {"code": ..., "message": "<the model server's JSON error, as a string>"}}` |
-| 401 | missing or wrong key | `{"error": {"code": "authentication_error", "message": ...}}` |
-| 429 | rate limit for your key | retry after a short wait |
+| 401 | no `Authorization` header, or not in the form `Bearer sk-...` | `{"error": {"code": "authentication_error", "message": "Authorization header missing or invalid format. ..."}}` |
+| 403 | key not valid | `{"error": {"code": "authentication_error", "message": "Access forbidden"}}` |
+| 429 | rate limit for your key | no `Retry-After` header; wait a second or two and retry |
 
 The `message` of a validation error is itself JSON; parse it to get the reason, for example
 `thinking: one of "off", "auto", "auto_forced", "always"`.
