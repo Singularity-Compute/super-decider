@@ -107,6 +107,10 @@ answers = json.loads(r.choices[0].message.content)["answers"]
 ```
 `usage` has the real token counts. `output_tokens` includes the thought when the request thinks.
 
+Chat completions ignore the `thinking` field. Put the setting in the schema JSON instead: `"adaptive": false` for no
+thought (like `"thinking": "off"`), or `"think": 512` for a thought of up to 512 tokens on every question (like
+`"thinking": "always"`).
+
 ## 3. Images
 Example image: [`invoice-demo.png`](invoice-demo.png). Images go as base64 data URLs (http(s) links
 are untested). The model was not fine-tuned on images. The first image request after a restart takes
