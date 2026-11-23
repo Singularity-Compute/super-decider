@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://benchmarkheaven.com/jev-models/api"><img alt="JevBench API board: #1 of 48" src="https://img.shields.io/badge/JevBench%20API-%231%20of%2048-0a7d3b"></a>
+  <a href="https://benchmarkheaven.com/jev-models/v1.7.0"><img alt="JevBench Composite: #1 in the 24 Oct 2026 snapshot (v1.7.0)" src="https://img.shields.io/badge/JevBench%20v1.7.0-%231%20Composite-0a7d3b"></a>
   <a href="https://huggingface.co/Singularity-Compute/super-decider"><img alt="Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-weights-ffd21e"></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
   <a href="https://asicloud.cudos.org/"><img alt="Hosted on ASI:Cloud" src="https://img.shields.io/badge/hosted-ASI%3ACloud-5634f8"></a>
@@ -34,17 +34,17 @@ Super Decider is built for the decisions inside your software: which team gets t
 
 ### JevBench
 
-Super Decider is #1 of 48 hosted decision APIs on the [JevBench API leaderboard](https://benchmarkheaven.com/jev-models/api) by Benchmark Heaven (board v1.7.48, 24 Oct 2026). The Composite score is the harmonic mean of intelligence, calibration, speed and cost over 1,500 decisions, 1,200 of them sealed. Capability is the mean of intelligence and calibration.
+Super Decider scored **78.5** on JevBench Composite and ranked **#1** in Benchmark Heaven’s [24 Oct 2026 release (v1.7.0)](https://benchmarkheaven.com/jev-models/v1.7.0). As of 23 Nov 2026, that score ranked **#2 of 55** on the [hosted API leaderboard](https://benchmarkheaven.com/jev-models/api). The Composite score is the harmonic mean of intelligence, calibration, speed and cost over 1,500 decisions, 1,200 of them sealed. Capability is the mean of intelligence and calibration.
 
 | System | Composite | Capability | Cost per 1,000 decisions | Median latency |
 |---|---|---|---|---|
-| Super Decider | **78.5** (#1) | 84.9 | $0.016 | 0.25 s |
-| Super Decider, thinking always | 74.5 (#8) | 85.9 | $0.028 | 0.89 s |
-| kettei-fat | 77.7 (#2) | **86.3** | $0.026 | 0.20 s |
-| Fastino GLiDE | 76.4 (#3) | 84.5 | $0.023 | 0.36 s |
-| Jev 1.13 | 71.4 (#14) | 77.1 | $0.032 | 0.24 s |
+| Super Decider | **78.5** | 84.9 | $0.016 | 0.25 s |
+| Super Decider, thinking always | 74.5 | 85.9 | $0.028 | 0.89 s |
+| kettei-fat | 77.7 | **86.3** | $0.026 | 0.20 s |
+| Fastino GLiDE | 76.4 | 84.5 | $0.023 | 0.36 s |
+| Jev 1.13 | 71.4 | 77.1 | $0.032 | 0.24 s |
 
-Both Super Decider rows were measured through our hosted API on 21 Oct 2026 and published at our request; see the [Super Decider page](https://benchmarkheaven.com/jev-models/singularity-super-decider) for the run details. Other rows come from the same board.
+Both Super Decider rows were measured through our hosted API on 21 Oct 2026 and published at our request; see the [Super Decider page](https://benchmarkheaven.com/jev-models/singularity-super-decider) for the run details. The table shows selected entries, not the full leaderboard.
 
 ### Decision tasks
 
